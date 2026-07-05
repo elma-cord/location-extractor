@@ -1,0 +1,168 @@
+name: Remote location extractor
+
+env:
+  PYTHONUNBUFFERED: "1"
+  # Rows per batch. Each batch writes its own output, so if the run is
+  # interrupted the completed batches are preserved in batch_outputs/.
+  BATCH_SIZE: "2000"
+  # Parallel fetch + model workers per batch (clamped 1-24 in main.py).
+  WORKERS: "12"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate required input files
+        run: |
+          test -f jobs_input.csv || (echo "Missing jobs_input.csv" && exit 1)
+          test -f predefined_locations.csv || (echo "Missing predefined_locations.csv" && exit 1)
+
+      - name: Validate OpenAI API key
+        run: |
+          test -n "${OPENAI_API_KEY}" || (echo "Missing OPENAI_API_KEY secret" && exit 1)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Split jobs_input.csv into batches
+        run: |
+          python - <<'PY'
+          import csv
+          import math
+          import os
+          from pathlib import Path
+
+          input_path = Path("jobs_input.csv")
+          batch_dir = Path("batches")
+          batch_dir.mkdir(exist_ok=True)
+
+          batch_size = int(os.environ.get("BATCH_SIZE", "2000"))
+
+          with input_path.open("r", encoding="utf-8-sig", newline="") as f:
+              reader = csv.reader(f)
+              rows = list(reader)
+
+          if not rows:
+              raise SystemExit("jobs_input.csv is empty")
+
+          header = rows[0]
+          data_rows = rows[1:]
+          if not data_rows:
+              raise SystemExit("jobs_input.csv has header only and no data rows")
+
+          total_batches = math.ceil(len(data_rows) / batch_size)
+          for i in range(total_batches):
+              start = i * batch_size
+              batch_rows = data_rows[start:start + batch_size]
+              batch_file = batch_dir / f"jobs_input_batch_{i+1:04d}.csv"
+              with batch_file.open("w", encoding="utf-8", newline="") as out:
+                  writer = csv.writer(out)
+                  writer.writerow(header)
+                  writer.writerows(batch_rows)
+
+          print(f"Created {total_batches} batch file(s) from {len(data_rows)} job rows.")
+          PY
+
+      - name: Run extractor batch by batch
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p batch_outputs
+
+          batch_count=$(find batches -maxdepth 1 -type f -name 'jobs_input_batch_*.csv' | sort | wc -l)
+          echo "Found ${batch_count} batch(es)."
+
+          current=0
+          for batch_file in $(find batches -maxdepth 1 -type f -name 'jobs_input_batch_*.csv' | sort); do
+            current=$((current + 1))
+            echo "========================================"
+            echo "Running batch ${current}/${batch_count}: ${batch_file}"
+            echo "========================================"
+
+            cp "${batch_file}" jobs_input.csv
+            rm -f jobs_output.csv
+
+            python main.py
+
+            if [ ! -f jobs_output.csv ]; then
+              echo "Batch ${current} failed: jobs_output.csv was not created"
+              exit 1
+            fi
+
+            cp jobs_output.csv "batch_outputs/jobs_output_batch_$(printf '%04d' "${current}").csv"
+          done
+
+      - name: Merge batch outputs
+        if: always()
+        run: |
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+
+          batch_dir = Path("batch_outputs")
+          output_path = Path("jobs_output.csv")
+
+          batch_files = sorted(batch_dir.glob("jobs_output_batch_*.csv"))
+          if not batch_files:
+              raise SystemExit("No batch output files found to merge.")
+
+          final_header = None
+          all_rows = []
+          for batch_file in batch_files:
+              with batch_file.open("r", encoding="utf-8-sig", newline="") as f:
+                  rows = list(csv.reader(f))
+              if not rows:
+                  continue
+              header, data = rows[0], rows[1:]
+              if final_header is None:
+                  final_header = header
+              elif header != final_header:
+                  raise SystemExit(f"Header mismatch in {batch_file}")
+              all_rows.extend(data)
+
+          if final_header is None:
+              raise SystemExit("No valid batch outputs found.")
+
+          with output_path.open("w", encoding="utf-8", newline="") as out:
+              writer = csv.writer(out)
+              writer.writerow(final_header)
+              writer.writerows(all_rows)
+
+          print(f"Merged {len(batch_files)} batch files into jobs_output.csv with {len(all_rows)} rows.")
+          PY
+
+      - name: Upload merged results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: jobs_output.csv
+          if-no-files-found: warn
+
+      - name: Upload batch results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-batches
+          path: batch_outputs/
+          if-no-files-found: warn
