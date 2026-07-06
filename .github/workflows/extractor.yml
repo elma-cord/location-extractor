@@ -5,8 +5,12 @@ env:
   # Rows per batch. Each batch writes its own output, so if the run is
   # interrupted the completed batches are preserved in batch_outputs/.
   BATCH_SIZE: "2000"
-  # Parallel fetch + model workers per batch (clamped 1-24 in main.py).
-  WORKERS: "12"
+  # Parallel workers per batch. Lower than a static-only run because each worker
+  # that hits a JavaScript page launches its own headless Chrome (memory-heavy
+  # on the free 2-CPU runner). Raise cautiously if runs are stable.
+  WORKERS: "6"
+  # Set to "0" to disable headless-Chrome rendering (static fetch only).
+  ENABLE_RENDER: "1"
 
 on:
   workflow_dispatch:
@@ -30,6 +34,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install --with-deps chromium
 
       - name: Validate required input files
         run: |
