@@ -15,13 +15,11 @@ from fetch_extract import fetch_job_page_text
 from prompts import build_prompt
 from rules import (
     get_primary_text_window,
-    extract_remote_preferences,
     extract_remote_days,
 )
 from validators import (
     clean_description,
     extract_json_object,
-    normalize_remote_preferences,
     normalize_remote_days,
     safe_str,
 )
@@ -73,12 +71,8 @@ class RemoteLocationExtractor:
     def _choose_best_location(self, ai_location: Any, page_text: str) -> str:
         ai_location_s = safe_str(ai_location).strip()
         if ai_location_s and ai_location_s.lower() != "unknown":
-            # Trust the location the model read from the page, worldwide. Only
-            # tidy London variants to "London, UK". Never discard a location for
-            # being outside the UK - this project is global.
             return self._collapse_london(ai_location_s)
 
-        # Model gave nothing usable -> recover a labelled location from the page.
         recovered = self._recover_location_from_text(page_text)
         if recovered:
             return self._collapse_london(recovered)
@@ -146,6 +140,36 @@ class RemoteLocationExtractor:
 
         return value
 
+    # --- single remote preference ---
+    @staticmethod
+    def _normalize_single_remote(value: Any) -> str:
+        allowed = ("onsite", "hybrid", "remote")
+        if isinstance(value, list):
+            items = [str(v).strip().lower() for v in value]
+        elif isinstance(value, str):
+            items = [x.strip().lower() for x in value.split(",")]
+        else:
+            items = []
+        items = [x for x in items if x in allowed]
+        if not items:
+            return ""
+        # Defensive: if the model returned more than one, a mix means hybrid.
+        if len(items) > 1:
+            return "hybrid"
+        return items[0]
+
+    @staticmethod
+    def _single_remote(ai_pref: str, remote_days: str) -> str:
+        # A stated split week (1-4 remote days) is hybrid by definition.
+        if remote_days in ("1", "2", "3", "4"):
+            return "hybrid"
+        if ai_pref in ("onsite", "hybrid", "remote"):
+            return ai_pref
+        if remote_days == "5":
+            return "remote"
+        # No clear signal -> leave empty (do not assume onsite).
+        return ""
+
     # --- run the model on one block of page text and compute the 3 fields ---
     def _extract_fields(self, page_text: str) -> dict:
         payload = {}
@@ -158,18 +182,18 @@ class RemoteLocationExtractor:
 
         job_location = self._choose_best_location(payload.get("job_location"), page_text)
 
-        ai_remote = normalize_remote_preferences(payload.get("remote_preferences", []))
-        det_remote = extract_remote_preferences(page_text)
-        remote_set = set(det_remote) | set(ai_remote)
-        remote_list = [x for x in ["onsite", "hybrid", "remote"] if x in remote_set]
-
         det_days = extract_remote_days(page_text)
         ai_days = normalize_remote_days(payload.get("remote_days", ""))
         remote_days = det_days if det_days != "not specified" else ai_days
 
+        ai_pref = self._normalize_single_remote(
+            payload.get("remote_preference", payload.get("remote_preferences"))
+        )
+        remote_preference = self._single_remote(ai_pref, remote_days)
+
         return {
             "job_location": job_location,
-            "remote_preferences": ", ".join(remote_list),
+            "remote_preferences": remote_preference,
             "remote_days": remote_days,
             "note": note,
         }
@@ -189,7 +213,6 @@ class RemoteLocationExtractor:
 
         render_enabled = os.getenv("ENABLE_RENDER", "1").strip() == "1"
 
-        # 1) Static fetch (free, fast).
         fetched = fetch_job_page_text(job_url, timeout=FETCH_TIMEOUT_SECONDS)
         static_text = clean_description(fetched.text) if (fetched.ok and fetched.text) else ""
 
@@ -204,8 +227,6 @@ class RemoteLocationExtractor:
                 reason = f"blocked ({reason})"
             note = f"static_failed: {reason}"
 
-        # 2) Render-on-miss: only spin up headless Chrome if the static pass
-        #    produced no location (empty page, or job_location == Unknown).
         need_render = render_enabled and (
             fields is None or fields["job_location"] == LOCATION_UNKNOWN
         )
@@ -214,8 +235,6 @@ class RemoteLocationExtractor:
             rendered_text = clean_description(rendered.text) if (rendered.ok and rendered.text) else ""
             if rendered_text:
                 rendered_fields = self._extract_fields(rendered_text)
-                # Keep the rendered result if it recovered a location, or if the
-                # static pass had produced nothing at all.
                 if fields is None or rendered_fields["job_location"] != LOCATION_UNKNOWN:
                     fields = rendered_fields
                     note = f"{rendered_fields['note']} (rendered)"
