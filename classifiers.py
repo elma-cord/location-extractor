@@ -1,3 +1,4 @@
+import os
 import re
 import time
 from typing import Any
@@ -145,7 +146,35 @@ class RemoteLocationExtractor:
 
         return value
 
-    # --- main entry point: read ONLY from the live job URL ---
+    # --- run the model on one block of page text and compute the 3 fields ---
+    def _extract_fields(self, page_text: str) -> dict:
+        payload = {}
+        note = "ok"
+        try:
+            raw = self._call_model(build_prompt(page_text))
+            payload = extract_json_object(raw) or {}
+        except Exception as exc:
+            note = f"model_failed: {exc}"
+
+        job_location = self._choose_best_location(payload.get("job_location"), page_text)
+
+        ai_remote = normalize_remote_preferences(payload.get("remote_preferences", []))
+        det_remote = extract_remote_preferences(page_text)
+        remote_set = set(det_remote) | set(ai_remote)
+        remote_list = [x for x in ["onsite", "hybrid", "remote"] if x in remote_set]
+
+        det_days = extract_remote_days(page_text)
+        ai_days = normalize_remote_days(payload.get("remote_days", ""))
+        remote_days = det_days if det_days != "not specified" else ai_days
+
+        return {
+            "job_location": job_location,
+            "remote_preferences": ", ".join(remote_list),
+            "remote_days": remote_days,
+            "note": note,
+        }
+
+    # --- main entry point: static fetch first, headless render only on a miss ---
     def extract(self, job_url: str) -> dict:
         result = {
             "job_location": LOCATION_UNKNOWN,
@@ -158,43 +187,48 @@ class RemoteLocationExtractor:
             result["notes"] = "missing_url"
             return result
 
+        render_enabled = os.getenv("ENABLE_RENDER", "1").strip() == "1"
+
+        # 1) Static fetch (free, fast).
         fetched = fetch_job_page_text(job_url, timeout=FETCH_TIMEOUT_SECONDS)
-        if not (fetched.ok and fetched.text):
+        static_text = clean_description(fetched.text) if (fetched.ok and fetched.text) else ""
+
+        fields = None
+        note = ""
+        if static_text:
+            fields = self._extract_fields(static_text)
+            note = fields["note"]
+        else:
             reason = fetched.error or (fetched.status_code and f"status_{fetched.status_code}") or "unknown"
             if fetched.blocked:
                 reason = f"blocked ({reason})"
-            result["notes"] = f"url_fetch_failed: {reason}"
+            note = f"static_failed: {reason}"
+
+        # 2) Render-on-miss: only spin up headless Chrome if the static pass
+        #    produced no location (empty page, or job_location == Unknown).
+        need_render = render_enabled and (
+            fields is None or fields["job_location"] == LOCATION_UNKNOWN
+        )
+        if need_render:
+            rendered = fetch_job_page_text(job_url, timeout=FETCH_TIMEOUT_SECONDS, render=True)
+            rendered_text = clean_description(rendered.text) if (rendered.ok and rendered.text) else ""
+            if rendered_text:
+                rendered_fields = self._extract_fields(rendered_text)
+                # Keep the rendered result if it recovered a location, or if the
+                # static pass had produced nothing at all.
+                if fields is None or rendered_fields["job_location"] != LOCATION_UNKNOWN:
+                    fields = rendered_fields
+                    note = f"{rendered_fields['note']} (rendered)"
+            else:
+                r_reason = rendered.error or (rendered.status_code and f"status_{rendered.status_code}") or "unknown"
+                note = f"render_failed: {r_reason}" if fields is None else f"{note}; render_failed: {r_reason}"
+
+        if fields is None:
+            result["notes"] = note or "no_content"
             return result
 
-        page_text = clean_description(fetched.text)
-        if not page_text:
-            result["notes"] = "empty_page_text"
-            return result
-
-        payload = {}
-        note = "ok"
-        try:
-            raw = self._call_model(build_prompt(page_text))
-            payload = extract_json_object(raw) or {}
-        except Exception as exc:
-            note = f"model_failed: {exc}"
-
-        # Location: trust the model's worldwide read, with a page-text fallback.
-        job_location = self._choose_best_location(payload.get("job_location"), page_text)
-
-        # Remote preferences: union the tuned regex extractor with the AI output.
-        ai_remote = normalize_remote_preferences(payload.get("remote_preferences", []))
-        det_remote = extract_remote_preferences(page_text)
-        remote_set = set(det_remote) | set(ai_remote)
-        remote_list = [x for x in ["onsite", "hybrid", "remote"] if x in remote_set]
-
-        # Remote days: deterministic wins if it fires, else the AI value.
-        det_days = extract_remote_days(page_text)
-        ai_days = normalize_remote_days(payload.get("remote_days", ""))
-        remote_days = det_days if det_days != "not specified" else ai_days
-
-        result["job_location"] = job_location
-        result["remote_preferences"] = ", ".join(remote_list)
-        result["remote_days"] = remote_days
+        result["job_location"] = fields["job_location"]
+        result["remote_preferences"] = fields["remote_preferences"]
+        result["remote_days"] = fields["remote_days"]
         result["notes"] = note
         return result
