@@ -13,9 +13,6 @@ from config import (
 from fetch_extract import fetch_job_page_text
 from prompts import build_prompt
 from rules import (
-    normalize_location_match,
-    is_explicitly_foreign_location_text,
-    has_disallowed_location_signal,
     get_primary_text_window,
     extract_remote_preferences,
     extract_remote_days,
@@ -30,12 +27,6 @@ from validators import (
 
 
 class RemoteLocationExtractor:
-    _UK_BROAD_TERMS = {
-        "uk", "united kingdom", "great britain", "britain", "gb",
-        "england", "scotland", "wales", "northern ireland",
-    }
-    _UK_REGION_RE = r"(?:England|Scotland|Wales|Northern Ireland|United Kingdom|U\.?K\.?|Great Britain)"
-
     def __init__(self, client, predefined_locations: list[str]):
         self.client = client
         self.predefined_locations = predefined_locations
@@ -77,36 +68,21 @@ class RemoteLocationExtractor:
 
         raise RuntimeError(f"model_call_failed: {last_error}")
 
-    # --- location selection (reused from the main pipeline) ---
+    # --- location selection (country-agnostic: keep the real worldwide location) ---
     def _choose_best_location(self, ai_location: Any, page_text: str) -> str:
-        ai_location_s = safe_str(ai_location)
-        ai_said_foreign = bool(ai_location_s) and is_explicitly_foreign_location_text(ai_location_s)
+        ai_location_s = safe_str(ai_location).strip()
         if ai_location_s and ai_location_s.lower() != "unknown":
-            if not ai_said_foreign:
-                normalized = normalize_location_match(ai_location_s, self.predefined_locations)
-                if normalized:
-                    return self._collapse_london(normalized)
-                broad = self._as_uk_broad(ai_location_s)
-                if broad:
-                    return broad
+            # Trust the location the model read from the page, worldwide. Only
+            # tidy London variants to "London, UK". Never discard a location for
+            # being outside the UK - this project is global.
+            return self._collapse_london(ai_location_s)
 
+        # Model gave nothing usable -> recover a labelled location from the page.
         recovered = self._recover_location_from_text(page_text)
         if recovered:
             return self._collapse_london(recovered)
 
-        if not ai_said_foreign and not has_disallowed_location_signal(page_text) and re.search(
-            r"\b(united kingdom|england|scotland|wales|northern ireland|uk)\b",
-            page_text,
-            flags=re.IGNORECASE,
-        ):
-            return "United Kingdom"
-
         return LOCATION_UNKNOWN
-
-    def _as_uk_broad(self, value: str) -> str:
-        v = (value or "").strip().lower().replace(".", "")
-        v = re.sub(r"\s+", " ", v).strip()
-        return "United Kingdom" if v in self._UK_BROAD_TERMS else ""
 
     def _recover_location_from_text(self, *texts: str) -> str:
         labelled_patterns = [
@@ -129,22 +105,8 @@ class RemoteLocationExtractor:
                         value,
                         maxsplit=1,
                     )[0].strip(" ,:-")
-                    if not value or is_explicitly_foreign_location_text(value):
-                        continue
-                    normalized = normalize_location_match(value, self.predefined_locations)
-                    if normalized and not self._is_broad_location(normalized):
-                        return normalized
-                    broad = self._as_uk_broad(value)
-                    if broad:
-                        return broad
-
-            for match in re.finditer(
-                rf"([A-Z][A-Za-z.\-' ]+?),\s*{self._UK_REGION_RE}\b", text
-            ):
-                city = (match.group(1) or "").strip()
-                normalized = normalize_location_match(f"{city}, UK", self.predefined_locations)
-                if normalized and not self._is_broad_location(normalized):
-                    return normalized
+                    if value and not self._is_broad_location(value):
+                        return value
 
         return ""
 
@@ -154,17 +116,10 @@ class RemoteLocationExtractor:
         return value_l in {
             "",
             "unknown",
-            "uk",
-            "united kingdom",
-            "england",
-            "scotland",
-            "wales",
-            "northern ireland",
-            "ireland",
-            "europe",
-            "emea",
             "global",
             "worldwide",
+            "anywhere",
+            "remote",
         }
 
     def _collapse_london(self, value: str) -> str:
@@ -224,7 +179,7 @@ class RemoteLocationExtractor:
         except Exception as exc:
             note = f"model_failed: {exc}"
 
-        # Location: AI read first, then deterministic recovery, guarded against foreign.
+        # Location: trust the model's worldwide read, with a page-text fallback.
         job_location = self._choose_best_location(payload.get("job_location"), page_text)
 
         # Remote preferences: union the tuned regex extractor with the AI output.
