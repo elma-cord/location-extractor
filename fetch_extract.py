@@ -1,9 +1,11 @@
+import html
 import json
 import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,10 +21,6 @@ DEFAULT_HEADERS = {
 }
 
 # --- Headless-Chrome rendering (Playwright) for JavaScript-loaded pages ---
-# Free: runs inside the GitHub Action. Only used when render=True (i.e. when the
-# static fetch produced no usable location). Images/fonts/trackers are blocked
-# for speed. Each worker thread gets its own browser (Playwright's sync API is
-# not shared across threads).
 PW_BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
 PW_BLOCK_URL_SUBSTRINGS = [
     "google-analytics.com", "googletagmanager.com", "doubleclick.net",
@@ -30,6 +28,10 @@ PW_BLOCK_URL_SUBSTRINGS = [
 ]
 RENDER_TIMEOUT_SECONDS = 45
 RENDER_WAIT_MS = 2500
+
+# --- ATS API fast-paths (free, exact) ---
+ATS_TIMEOUT_SECONDS = 20
+ATS_CONTENT_MAX_CHARS = 15000
 
 _thread_local = threading.local()
 
@@ -60,6 +62,7 @@ class FetchResult:
     text: str
     error: str
     rendered: bool = False
+    source: str = "static"
 
 
 def _clean_text(text: str) -> str:
@@ -93,10 +96,6 @@ def _address_to_line(addr) -> str:
 
 
 def _extract_job_location_lines(job_location, out: list[str]) -> None:
-    # A JobPosting.jobLocation is a Place (or list of Places); the address lives
-    # under "address". We ONLY read locations from here - never from a top-level
-    # Organization / hiringOrganization address (that is the company HQ, not the
-    # role location).
     if isinstance(job_location, list):
         for item in job_location:
             _extract_job_location_lines(item, out)
@@ -118,8 +117,6 @@ def _extract_job_location_lines(job_location, out: list[str]) -> None:
 
 
 def _collect_structured_lines(obj, out: list[str]) -> None:
-    # Find JobPosting objects anywhere in the ld+json graph and extract ONLY
-    # their role-specific location fields.
     if isinstance(obj, dict):
         types = obj.get("@type")
         type_list = types if isinstance(types, list) else [types]
@@ -154,7 +151,6 @@ def _collect_structured_lines(obj, out: list[str]) -> None:
 
 def _extract_structured_text_from_html(soup: BeautifulSoup) -> str:
     lines = []
-
     for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
         raw = script.string or script.get_text() or ""
         raw = raw.strip()
@@ -165,7 +161,6 @@ def _extract_structured_text_from_html(soup: BeautifulSoup) -> str:
             _collect_structured_lines(data, lines)
         except Exception:
             continue
-
     return _clean_text("\n".join(lines))
 
 
@@ -179,11 +174,11 @@ def _extract_title_text(soup: BeautifulSoup) -> str:
     return _clean_text("\n".join(bits))
 
 
-def _html_to_text(html: str) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
+def _html_to_text(html_doc: str) -> str:
+    soup = BeautifulSoup(html_doc or "", "html.parser")
 
     title_text = _extract_title_text(soup)
-    structured_text = _extract_structured_text_from_html(BeautifulSoup(html or "", "html.parser"))
+    structured_text = _extract_structured_text_from_html(BeautifulSoup(html_doc or "", "html.parser"))
 
     meta_texts = []
     for attr in ("description", "og:description", "twitter:description"):
@@ -211,11 +206,196 @@ def _html_to_text(html: str) -> str:
     return _clean_text("\n".join(combined_parts))
 
 
+def _strip_html_fragment(fragment: str) -> str:
+    if not fragment:
+        return ""
+    if "<" in fragment:
+        fragment = BeautifulSoup(fragment, "html.parser").get_text("\n")
+    return _clean_text(fragment)
+
+
 def _is_blocked(status_code: Optional[int], text: str) -> bool:
     if status_code in {401, 403, 406, 429, 503}:
         return True
     lower = (text or "").lower()
     return any(re.search(p, lower) for p in BLOCK_PATTERNS)
+
+
+# --- ATS builders: return a text blob with an explicit "Location:" line ---
+def _build_ats_text(title, location, workplace, content) -> Optional[str]:
+    parts = []
+    if location:
+        parts.append(f"Location: {location}")
+    if workplace:
+        parts.append(f"Workplace type: {workplace}")
+    if title:
+        parts.append(str(title))
+    body = _strip_html_fragment(content or "")
+    if body:
+        parts.append(body)
+    text = _clean_text("\n\n".join(parts))
+    if not text:
+        return None
+    return text[:ATS_CONTENT_MAX_CHARS]
+
+
+def _ats_greenhouse(url: str) -> Optional[str]:
+    jid = None
+    token = None
+
+    m_direct = re.search(r"greenhouse\.io/(?:embed/[^/?#]+\?for=)?([A-Za-z0-9_-]+)/jobs/(\d+)", url)
+    if m_direct:
+        token, jid = m_direct.group(1), m_direct.group(2)
+
+    m_jid = re.search(r"[?&]gh_jid=(\d+)", url)
+    if m_jid:
+        jid = m_jid.group(1)
+
+    if jid and not token:
+        try:
+            page = requests.get(url, headers=DEFAULT_HEADERS, timeout=ATS_TIMEOUT_SECONDS)
+            tok = re.search(r"job_board/js\?for=([A-Za-z0-9_-]+)", page.text or "")
+            if tok:
+                token = tok.group(1)
+        except Exception:
+            return None
+
+    if not (token and jid):
+        return None
+
+    api = requests.get(
+        f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs/{jid}",
+        timeout=ATS_TIMEOUT_SECONDS,
+    )
+    if not api.ok:
+        return None
+    d = api.json()
+    loc = (d.get("location") or {}).get("name") or ""
+    if not loc:
+        offices = [o.get("name") for o in (d.get("offices") or []) if isinstance(o, dict) and o.get("name")]
+        loc = offices[0] if offices else ""
+    return _build_ats_text(d.get("title"), loc, "", html.unescape(d.get("content") or ""))
+
+
+def _ats_lever(url: str) -> Optional[str]:
+    m = re.search(r"lever\.co/([^/?#]+)/([0-9a-fA-F-]{6,})", url)
+    if not m:
+        return None
+    company, jid = m.group(1), m.group(2)
+    api = requests.get(f"https://api.lever.co/v0/postings/{company}/{jid}", timeout=ATS_TIMEOUT_SECONDS)
+    if not api.ok:
+        return None
+    d = api.json()
+    if isinstance(d, list):
+        d = d[0] if d else {}
+    cats = d.get("categories") or {}
+    loc = cats.get("location") or (cats.get("allLocations") or [""])[0] or d.get("country") or ""
+    content = d.get("descriptionPlain") or d.get("description") or ""
+    return _build_ats_text(d.get("text"), loc, d.get("workplaceType") or "", content)
+
+
+def _ats_ashby(url: str) -> Optional[str]:
+    m = re.search(r"ashbyhq\.com/([^/?#]+)/([0-9a-fA-F-]{6,})", url)
+    if not m:
+        return None
+    org, jid = m.group(1), m.group(2)
+    api = requests.get(
+        f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=false",
+        timeout=max(ATS_TIMEOUT_SECONDS, 25),
+    )
+    if not api.ok:
+        return None
+    jobs = (api.json() or {}).get("jobs") or []
+    job = next(
+        (j for j in jobs if j.get("id") == jid or jid in (j.get("jobUrl") or "")),
+        None,
+    )
+    if not job:
+        return None
+    loc = job.get("location") or ""
+    secondary = ", ".join([s for s in (job.get("secondaryLocations") or []) if isinstance(s, str)])
+    if secondary:
+        loc = f"{loc} / {secondary}" if loc else secondary
+    workplace = job.get("workplaceType") or ("remote" if job.get("isRemote") else "")
+    return _build_ats_text(job.get("title"), loc, workplace, job.get("descriptionPlain") or "")
+
+
+def _ats_smartrecruiters(url: str) -> Optional[str]:
+    m = re.search(r"smartrecruiters\.com/([^/?#]+)/(\d+)", url)
+    if not m:
+        return None
+    company, pid = m.group(1), m.group(2)
+    api = requests.get(
+        f"https://api.smartrecruiters.com/v1/companies/{company}/postings/{pid}",
+        timeout=ATS_TIMEOUT_SECONDS,
+    )
+    if not api.ok:
+        return None
+    d = api.json()
+    loc = d.get("location") or {}
+    loc_str = _join_address_parts([
+        str(loc.get("city") or ""),
+        str(loc.get("region") or ""),
+        str(loc.get("country") or "").upper(),
+    ])
+    workplace = "remote" if loc.get("remote") else ""
+    sections = ((d.get("jobAd") or {}).get("sections") or {})
+    content_bits = []
+    for key in ("jobDescription", "qualifications", "additionalInformation"):
+        sec = sections.get(key) or {}
+        txt = sec.get("text") or ""
+        if txt:
+            content_bits.append(txt)
+    return _build_ats_text(d.get("name"), loc_str, workplace, "\n".join(content_bits))
+
+
+def _ats_workday(url: str) -> Optional[str]:
+    p = urlparse(url)
+    host = p.netloc
+    tenant = host.split(".")[0]
+    segs = [s for s in p.path.split("/") if s]
+    if "job" not in segs:
+        return None
+    ji = segs.index("job")
+    if ji == 0:
+        return None
+    site = segs[ji - 1]
+    jobpath = "/".join(segs[ji:])
+    cxs = f"https://{host}/wday/cxs/{tenant}/{site}/{jobpath}"
+
+    headers = dict(DEFAULT_HEADERS)
+    headers["Accept"] = "application/json"
+    headers["Referer"] = url
+
+    api = requests.get(cxs, headers=headers, timeout=ATS_TIMEOUT_SECONDS)
+    if not api.ok:
+        return None
+    info = (api.json() or {}).get("jobPostingInfo") or {}
+    loc = info.get("location") or ""
+    addl = [a for a in (info.get("additionalLocations") or []) if isinstance(a, str) and a.strip()]
+    if addl:
+        loc = f"{loc} / {', '.join(addl)}" if loc else ", ".join(addl)
+    workplace = info.get("remoteType") or ""
+    content = html.unescape(info.get("jobDescription") or "")
+    return _build_ats_text(info.get("title"), loc, workplace, content)
+
+
+def _fetch_ats_text(url: str) -> Optional[str]:
+    host = (urlparse(url).netloc or "").lower()
+    try:
+        if "myworkdayjobs.com" in host:
+            return _ats_workday(url)
+        if "gh_jid=" in url or "greenhouse.io" in host:
+            return _ats_greenhouse(url)
+        if "lever.co" in host:
+            return _ats_lever(url)
+        if "ashbyhq.com" in host:
+            return _ats_ashby(url)
+        if "smartrecruiters.com" in host:
+            return _ats_smartrecruiters(url)
+    except Exception:
+        return None
+    return None
 
 
 # --- Playwright: one headless browser per worker thread ---
@@ -268,9 +448,9 @@ def _render_html(url: str, timeout: int) -> tuple[Optional[int], str, str]:
         except Exception:
             pass
 
-        html = page.content()
+        html_doc = page.content()
         final_url = page.url
-        return status, final_url, html
+        return status, final_url, html_doc
     finally:
         try:
             page.close()
@@ -287,7 +467,7 @@ def fetch_job_page_text(
     if not url:
         return FetchResult(
             url=url, final_url=url, status_code=None, ok=False,
-            blocked=False, text="", error="missing_url", rendered=False,
+            blocked=False, text="", error="missing_url", rendered=False, source="none",
         )
 
     try:
@@ -295,23 +475,32 @@ def fetch_job_page_text(
             time.sleep(sleep_seconds)
 
         if render:
-            status_code, final_url, html = _render_html(url, max(timeout, RENDER_TIMEOUT_SECONDS))
-            text = _html_to_text(html)
+            status_code, final_url, html_doc = _render_html(url, max(timeout, RENDER_TIMEOUT_SECONDS))
+            text = _html_to_text(html_doc)
             blocked = _is_blocked(status_code, text)
             ok = (status_code is None or status_code < 400) and not blocked and bool(text)
             return FetchResult(
                 url=url, final_url=final_url, status_code=status_code,
-                ok=ok, blocked=blocked, text=text, error="", rendered=True,
+                ok=ok, blocked=blocked, text=text, error="", rendered=True, source="render",
             )
 
+        # 1) ATS API fast-path (Workday / Greenhouse / Lever / Ashby / SmartRecruiters)
+        ats_text = _fetch_ats_text(url)
+        if ats_text:
+            return FetchResult(
+                url=url, final_url=url, status_code=200, ok=True,
+                blocked=False, text=ats_text, error="", rendered=False, source="ats",
+            )
+
+        # 2) Plain static fetch
         response = requests.get(
             url,
             headers=DEFAULT_HEADERS,
             timeout=timeout,
             allow_redirects=True,
         )
-        html = response.text or ""
-        text = _html_to_text(html)
+        html_doc = response.text or ""
+        text = _html_to_text(html_doc)
         blocked = _is_blocked(response.status_code, text)
         return FetchResult(
             url=url,
@@ -322,10 +511,11 @@ def fetch_job_page_text(
             text=text,
             error="",
             rendered=False,
+            source="static",
         )
     except Exception as exc:
         prefix = "render_fetch_error" if render else "fetch_error"
         return FetchResult(
             url=url, final_url=url, status_code=None, ok=False,
-            blocked=False, text="", error=f"{prefix}: {exc}", rendered=render,
+            blocked=False, text="", error=f"{prefix}: {exc}", rendered=render, source="error",
         )
