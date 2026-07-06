@@ -19,6 +19,7 @@ DEFAULT_HEADERS = {
     ),
     "Accept-Language": "en-GB,en;q=0.9,en-US;q=0.8",
 }
+_ATS_HEADERS = {**DEFAULT_HEADERS, "Accept": "application/json"}
 
 # --- Headless-Chrome rendering (Playwright) for JavaScript-loaded pages ---
 PW_BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
@@ -74,11 +75,11 @@ def _clean_text(text: str) -> str:
     return text.strip()
 
 
-def _join_address_parts(parts: list[str]) -> str:
+def _join_address_parts(parts) -> str:
     clean = []
     for part in parts:
-        part = (part or "").strip()
-        if part and part not in clean:
+        part = str(part or "").strip()
+        if part and part.lower() not in ("none", "null") and part not in clean:
             clean.append(part)
     return ", ".join(clean)
 
@@ -86,16 +87,16 @@ def _join_address_parts(parts: list[str]) -> str:
 def _address_to_line(addr) -> str:
     if isinstance(addr, dict):
         return _join_address_parts([
-            str(addr.get("addressLocality") or ""),
-            str(addr.get("addressRegion") or ""),
-            str(addr.get("addressCountry") or ""),
+            addr.get("addressLocality"),
+            addr.get("addressRegion"),
+            addr.get("addressCountry"),
         ])
     if isinstance(addr, str):
         return addr.strip()
     return ""
 
 
-def _extract_job_location_lines(job_location, out: list[str]) -> None:
+def _extract_job_location_lines(job_location, out: list) -> None:
     if isinstance(job_location, list):
         for item in job_location:
             _extract_job_location_lines(item, out)
@@ -116,7 +117,7 @@ def _extract_job_location_lines(job_location, out: list[str]) -> None:
         out.append(f"Location: {job_location.strip()}")
 
 
-def _collect_structured_lines(obj, out: list[str]) -> None:
+def _collect_structured_lines(obj, out: list) -> None:
     if isinstance(obj, dict):
         types = obj.get("@type")
         type_list = types if isinstance(types, list) else [types]
@@ -221,7 +222,11 @@ def _is_blocked(status_code: Optional[int], text: str) -> bool:
     return any(re.search(p, lower) for p in BLOCK_PATTERNS)
 
 
-# --- ATS builders: return a text blob with an explicit "Location:" line ---
+# =====================================================================
+# ATS API fast-paths: each returns a text blob with an explicit
+# "Location:" line, or None. All are wrapped by _fetch_ats_text so any
+# failure falls through to static -> render.
+# =====================================================================
 def _build_ats_text(title, location, workplace, content) -> Optional[str]:
     parts = []
     if location:
@@ -239,18 +244,53 @@ def _build_ats_text(title, location, workplace, content) -> Optional[str]:
     return text[:ATS_CONTENT_MAX_CHARS]
 
 
-def _ats_greenhouse(url: str) -> Optional[str]:
-    jid = None
-    token = None
+def _ats_workday(url: str) -> Optional[str]:
+    p = urlparse(url)
+    host = p.netloc
+    segs = [s for s in p.path.split("/") if s]
+    if "job" not in segs:
+        return None
+    ji = segs.index("job")
 
+    if "myworkdaysite.com" in host:
+        # /{lang}/recruiting/{tenant}/{site}/job/...
+        if "recruiting" not in segs:
+            return None
+        ri = segs.index("recruiting")
+        if ri + 2 >= ji:
+            return None
+        tenant, site = segs[ri + 1], segs[ri + 2]
+    else:
+        # {tenant}.wdN.myworkdayjobs.com/{lang}/{site}/job/...
+        tenant = host.split(".")[0]
+        if ji == 0:
+            return None
+        site = segs[ji - 1]
+
+    jobpath = "/".join(segs[ji:])
+    cxs = f"https://{host}/wday/cxs/{tenant}/{site}/{jobpath}"
+    headers = {**_ATS_HEADERS, "Referer": url}
+
+    api = requests.get(cxs, headers=headers, timeout=ATS_TIMEOUT_SECONDS)
+    if not api.ok:
+        return None
+    info = (api.json() or {}).get("jobPostingInfo") or {}
+    loc = info.get("location") or ""
+    addl = [a for a in (info.get("additionalLocations") or []) if isinstance(a, str) and a.strip()]
+    if addl:
+        loc = f"{loc} / {', '.join(addl)}" if loc else ", ".join(addl)
+    return _build_ats_text(info.get("title"), loc, info.get("remoteType") or "",
+                           html.unescape(info.get("jobDescription") or ""))
+
+
+def _ats_greenhouse(url: str) -> Optional[str]:
+    jid = token = None
     m_direct = re.search(r"greenhouse\.io/(?:embed/[^/?#]+\?for=)?([A-Za-z0-9_-]+)/jobs/(\d+)", url)
     if m_direct:
         token, jid = m_direct.group(1), m_direct.group(2)
-
     m_jid = re.search(r"[?&]gh_jid=(\d+)", url)
     if m_jid:
         jid = m_jid.group(1)
-
     if jid and not token:
         try:
             page = requests.get(url, headers=DEFAULT_HEADERS, timeout=ATS_TIMEOUT_SECONDS)
@@ -259,22 +299,22 @@ def _ats_greenhouse(url: str) -> Optional[str]:
                 token = tok.group(1)
         except Exception:
             return None
-
     if not (token and jid):
         return None
-
-    api = requests.get(
-        f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs/{jid}",
-        timeout=ATS_TIMEOUT_SECONDS,
-    )
-    if not api.ok:
-        return None
-    d = api.json()
-    loc = (d.get("location") or {}).get("name") or ""
-    if not loc:
-        offices = [o.get("name") for o in (d.get("offices") or []) if isinstance(o, dict) and o.get("name")]
-        loc = offices[0] if offices else ""
-    return _build_ats_text(d.get("title"), loc, "", html.unescape(d.get("content") or ""))
+    for api_host in ("boards-api.greenhouse.io", "boards-api.eu.greenhouse.io"):
+        try:
+            api = requests.get(f"https://{api_host}/v1/boards/{token}/jobs/{jid}",
+                               headers=_ATS_HEADERS, timeout=ATS_TIMEOUT_SECONDS)
+            if api.ok:
+                d = api.json()
+                loc = (d.get("location") or {}).get("name") or ""
+                if not loc:
+                    offices = [o.get("name") for o in (d.get("offices") or []) if isinstance(o, dict) and o.get("name")]
+                    loc = offices[0] if offices else ""
+                return _build_ats_text(d.get("title"), loc, "", html.unescape(d.get("content") or ""))
+        except Exception:
+            continue
+    return None
 
 
 def _ats_lever(url: str) -> Optional[str]:
@@ -282,7 +322,8 @@ def _ats_lever(url: str) -> Optional[str]:
     if not m:
         return None
     company, jid = m.group(1), m.group(2)
-    api = requests.get(f"https://api.lever.co/v0/postings/{company}/{jid}", timeout=ATS_TIMEOUT_SECONDS)
+    api = requests.get(f"https://api.lever.co/v0/postings/{company}/{jid}",
+                       headers=_ATS_HEADERS, timeout=ATS_TIMEOUT_SECONDS)
     if not api.ok:
         return None
     d = api.json()
@@ -299,17 +340,12 @@ def _ats_ashby(url: str) -> Optional[str]:
     if not m:
         return None
     org, jid = m.group(1), m.group(2)
-    api = requests.get(
-        f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=false",
-        timeout=max(ATS_TIMEOUT_SECONDS, 25),
-    )
+    api = requests.get(f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=false",
+                       headers=_ATS_HEADERS, timeout=max(ATS_TIMEOUT_SECONDS, 25))
     if not api.ok:
         return None
     jobs = (api.json() or {}).get("jobs") or []
-    job = next(
-        (j for j in jobs if j.get("id") == jid or jid in (j.get("jobUrl") or "")),
-        None,
-    )
+    job = next((j for j in jobs if j.get("id") == jid or jid in (j.get("jobUrl") or "")), None)
     if not job:
         return None
     loc = job.get("location") or ""
@@ -325,65 +361,104 @@ def _ats_smartrecruiters(url: str) -> Optional[str]:
     if not m:
         return None
     company, pid = m.group(1), m.group(2)
-    api = requests.get(
-        f"https://api.smartrecruiters.com/v1/companies/{company}/postings/{pid}",
-        timeout=ATS_TIMEOUT_SECONDS,
-    )
+    api = requests.get(f"https://api.smartrecruiters.com/v1/companies/{company}/postings/{pid}",
+                       headers=_ATS_HEADERS, timeout=ATS_TIMEOUT_SECONDS)
     if not api.ok:
         return None
     d = api.json()
     loc = d.get("location") or {}
-    loc_str = _join_address_parts([
-        str(loc.get("city") or ""),
-        str(loc.get("region") or ""),
-        str(loc.get("country") or "").upper(),
-    ])
+    loc_str = _join_address_parts([loc.get("city"), loc.get("region"), str(loc.get("country") or "").upper()])
     workplace = "remote" if loc.get("remote") else ""
     sections = ((d.get("jobAd") or {}).get("sections") or {})
     content_bits = []
     for key in ("jobDescription", "qualifications", "additionalInformation"):
-        sec = sections.get(key) or {}
-        txt = sec.get("text") or ""
+        txt = (sections.get(key) or {}).get("text") or ""
         if txt:
             content_bits.append(txt)
     return _build_ats_text(d.get("name"), loc_str, workplace, "\n".join(content_bits))
 
 
-def _ats_workday(url: str) -> Optional[str]:
-    p = urlparse(url)
-    host = p.netloc
-    tenant = host.split(".")[0]
-    segs = [s for s in p.path.split("/") if s]
-    if "job" not in segs:
+def _ats_workable(url: str) -> Optional[str]:
+    m = re.search(r"apply\.workable\.com/([^/?#]+)/j/([A-Za-z0-9]+)", url)
+    if not m:
         return None
-    ji = segs.index("job")
-    if ji == 0:
-        return None
-    site = segs[ji - 1]
-    jobpath = "/".join(segs[ji:])
-    cxs = f"https://{host}/wday/cxs/{tenant}/{site}/{jobpath}"
-
-    headers = dict(DEFAULT_HEADERS)
-    headers["Accept"] = "application/json"
-    headers["Referer"] = url
-
-    api = requests.get(cxs, headers=headers, timeout=ATS_TIMEOUT_SECONDS)
+    acct, sc = m.group(1), m.group(2)
+    api = requests.get(f"https://apply.workable.com/api/v2/accounts/{acct}/jobs/{sc}",
+                       headers=_ATS_HEADERS, timeout=ATS_TIMEOUT_SECONDS)
     if not api.ok:
         return None
-    info = (api.json() or {}).get("jobPostingInfo") or {}
-    loc = info.get("location") or ""
-    addl = [a for a in (info.get("additionalLocations") or []) if isinstance(a, str) and a.strip()]
-    if addl:
-        loc = f"{loc} / {', '.join(addl)}" if loc else ", ".join(addl)
-    workplace = info.get("remoteType") or ""
-    content = html.unescape(info.get("jobDescription") or "")
-    return _build_ats_text(info.get("title"), loc, workplace, content)
+    d = api.json()
+    loc = d.get("location") or {}
+    loc_str = _join_address_parts([loc.get("city"), loc.get("region"), loc.get("country")])
+    workplace = d.get("workplace") or ("remote" if d.get("remote") else "")
+    return _build_ats_text(d.get("title"), loc_str, workplace, d.get("description") or "")
+
+
+def _ats_oracle(url: str) -> Optional[str]:
+    p = urlparse(url)
+    host = p.netloc
+    m = re.search(r"/job/(\d+)", p.path)
+    if not m:
+        return None
+    jid = m.group(1)
+    api = requests.get(
+        f"https://{host}/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails/{jid}?expand=all&onlyData=true",
+        headers=_ATS_HEADERS, timeout=ATS_TIMEOUT_SECONDS,
+    )
+    if not api.ok:
+        return None
+    d = api.json() or {}
+    loc = d.get("PrimaryLocation") or ""
+    workplace = d.get("WorkplaceType") or d.get("WorkplaceTypeCode") or ""
+    content = ""
+    for key in ("ExternalDescriptionStr", "ExternalResponsibilitiesStr",
+                "ExternalQualificationsStr", "ShortDescriptionStr"):
+        val = d.get(key)
+        if val:
+            content += "\n" + str(val)
+    return _build_ats_text(d.get("Title"), loc, workplace, html.unescape(content))
+
+
+def _ats_bamboohr(url: str) -> Optional[str]:
+    m = re.search(r"https?://([^.]+)\.bamboohr\.com/careers/(\d+)", url)
+    if not m:
+        return None
+    comp, jid = m.group(1), m.group(2)
+    api = requests.get(f"https://{comp}.bamboohr.com/careers/{jid}/detail",
+                       headers=_ATS_HEADERS, timeout=ATS_TIMEOUT_SECONDS)
+    if not api.ok:
+        return None
+    jo = ((api.json() or {}).get("result") or {}).get("jobOpening") or {}
+    loc = jo.get("location") or {}
+    loc_str = _join_address_parts([loc.get("city"), loc.get("state"), loc.get("addressCountry")])
+    title = jo.get("jobOpeningName") or jo.get("title") or ""
+    content = jo.get("description") or jo.get("jobDescription") or ""
+    return _build_ats_text(title, loc_str, "", content)
+
+
+def _ats_recruitee(url: str) -> Optional[str]:
+    m = re.search(r"https?://([^.]+)\.recruitee\.com/o/([^/?#]+)", url)
+    if not m:
+        return None
+    comp, slug = m.group(1), m.group(2)
+    api = requests.get(f"https://{comp}.recruitee.com/api/offers/",
+                       headers=_ATS_HEADERS, timeout=ATS_TIMEOUT_SECONDS)
+    if not api.ok:
+        return None
+    offers = (api.json() or {}).get("offers") or []
+    off = next((o for o in offers if o.get("slug") == slug), None) \
+        or next((o for o in offers if slug in (o.get("slug") or "")), None)
+    if not off:
+        return None
+    loc = off.get("location") or _join_address_parts([off.get("city"), off.get("country")])
+    workplace = "remote" if off.get("remote") else ""
+    return _build_ats_text(off.get("title"), loc, workplace, off.get("description") or "")
 
 
 def _fetch_ats_text(url: str) -> Optional[str]:
     host = (urlparse(url).netloc or "").lower()
     try:
-        if "myworkdayjobs.com" in host:
+        if "myworkdayjobs.com" in host or "myworkdaysite.com" in host:
             return _ats_workday(url)
         if "gh_jid=" in url or "greenhouse.io" in host:
             return _ats_greenhouse(url)
@@ -393,6 +468,14 @@ def _fetch_ats_text(url: str) -> Optional[str]:
             return _ats_ashby(url)
         if "smartrecruiters.com" in host:
             return _ats_smartrecruiters(url)
+        if "workable.com" in host:
+            return _ats_workable(url)
+        if "oraclecloud.com" in host:
+            return _ats_oracle(url)
+        if "bamboohr.com" in host:
+            return _ats_bamboohr(url)
+        if "recruitee.com" in host:
+            return _ats_recruitee(url)
     except Exception:
         return None
     return None
@@ -410,7 +493,7 @@ def _get_thread_browser():
     return _thread_local.browser
 
 
-def _render_html(url: str, timeout: int) -> tuple[Optional[int], str, str]:
+def _render_html(url: str, timeout: int):
     browser = _get_thread_browser()
     page = browser.new_page()
     try:
@@ -484,7 +567,7 @@ def fetch_job_page_text(
                 ok=ok, blocked=blocked, text=text, error="", rendered=True, source="render",
             )
 
-        # 1) ATS API fast-path (Workday / Greenhouse / Lever / Ashby / SmartRecruiters)
+        # 1) ATS API fast-path
         ats_text = _fetch_ats_text(url)
         if ats_text:
             return FetchResult(
@@ -493,12 +576,7 @@ def fetch_job_page_text(
             )
 
         # 2) Plain static fetch
-        response = requests.get(
-            url,
-            headers=DEFAULT_HEADERS,
-            timeout=timeout,
-            allow_redirects=True,
-        )
+        response = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout, allow_redirects=True)
         html_doc = response.text or ""
         text = _html_to_text(html_doc)
         blocked = _is_blocked(response.status_code, text)
