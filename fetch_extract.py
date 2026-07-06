@@ -1,5 +1,6 @@
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -16,6 +17,21 @@ DEFAULT_HEADERS = {
     ),
     "Accept-Language": "en-GB,en;q=0.9,en-US;q=0.8",
 }
+
+# --- Headless-Chrome rendering (Playwright) for JavaScript-loaded pages ---
+# Free: runs inside the GitHub Action. Only used when render=True (i.e. when the
+# static fetch produced no usable location). Images/fonts/trackers are blocked
+# for speed. Each worker thread gets its own browser (Playwright's sync API is
+# not shared across threads).
+PW_BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
+PW_BLOCK_URL_SUBSTRINGS = [
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "segment.com", "hotjar.com", "fullstory.com",
+]
+RENDER_TIMEOUT_SECONDS = 45
+RENDER_WAIT_MS = 2500
+
+_thread_local = threading.local()
 
 
 BLOCK_PATTERNS = [
@@ -43,11 +59,12 @@ class FetchResult:
     blocked: bool
     text: str
     error: str
+    rendered: bool = False
 
 
 def _clean_text(text: str) -> str:
     text = text or ""
-    text = text.replace(" ", " ")
+    text = text.replace("\u00a0", " ")
     text = re.sub(r"\r\n?", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -79,7 +96,7 @@ def _extract_job_location_lines(job_location, out: list[str]) -> None:
     # A JobPosting.jobLocation is a Place (or list of Places); the address lives
     # under "address". We ONLY read locations from here - never from a top-level
     # Organization / hiringOrganization address (that is the company HQ, not the
-    # role location, and was wrongly overriding real UK roles).
+    # role location).
     if isinstance(job_location, list):
         for item in job_location:
             _extract_job_location_lines(item, out)
@@ -126,7 +143,6 @@ def _collect_structured_lines(obj, out: list[str]) -> None:
             if isinstance(workplace, str) and workplace.strip():
                 out.append(f"Workplace type: {workplace.strip()}")
 
-        # Recurse so nested / @graph-wrapped JobPostings are still found.
         for value in obj.values():
             if isinstance(value, (dict, list)):
                 _collect_structured_lines(value, out)
@@ -202,21 +218,91 @@ def _is_blocked(status_code: Optional[int], text: str) -> bool:
     return any(re.search(p, lower) for p in BLOCK_PATTERNS)
 
 
-def fetch_job_page_text(url: str, timeout: int = 25, sleep_seconds: float = 0.0) -> FetchResult:
+# --- Playwright: one headless browser per worker thread ---
+def _get_thread_browser():
+    if not hasattr(_thread_local, "browser"):
+        from playwright.sync_api import sync_playwright
+        _thread_local.pw = sync_playwright().start()
+        _thread_local.browser = _thread_local.pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+    return _thread_local.browser
+
+
+def _render_html(url: str, timeout: int) -> tuple[Optional[int], str, str]:
+    browser = _get_thread_browser()
+    page = browser.new_page()
+    try:
+        def route_handler(route, request):
+            try:
+                if (request.resource_type or "").lower() in PW_BLOCK_RESOURCE_TYPES:
+                    route.abort()
+                    return
+                if any(s in (request.url or "").lower() for s in PW_BLOCK_URL_SUBSTRINGS):
+                    route.abort()
+                    return
+                route.continue_()
+            except Exception:
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
+
+        try:
+            page.route("**/*", route_handler)
+        except Exception:
+            pass
+
+        status = None
+        try:
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            if resp:
+                status = resp.status
+        except Exception:
+            pass
+
+        page.wait_for_timeout(RENDER_WAIT_MS)
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+
+        html = page.content()
+        final_url = page.url
+        return status, final_url, html
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+def fetch_job_page_text(
+    url: str,
+    timeout: int = 25,
+    sleep_seconds: float = 0.0,
+    render: bool = False,
+) -> FetchResult:
     if not url:
         return FetchResult(
-            url=url,
-            final_url=url,
-            status_code=None,
-            ok=False,
-            blocked=False,
-            text="",
-            error="missing_url",
+            url=url, final_url=url, status_code=None, ok=False,
+            blocked=False, text="", error="missing_url", rendered=False,
         )
 
     try:
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
+
+        if render:
+            status_code, final_url, html = _render_html(url, max(timeout, RENDER_TIMEOUT_SECONDS))
+            text = _html_to_text(html)
+            blocked = _is_blocked(status_code, text)
+            ok = (status_code is None or status_code < 400) and not blocked and bool(text)
+            return FetchResult(
+                url=url, final_url=final_url, status_code=status_code,
+                ok=ok, blocked=blocked, text=text, error="", rendered=True,
+            )
 
         response = requests.get(
             url,
@@ -224,11 +310,9 @@ def fetch_job_page_text(url: str, timeout: int = 25, sleep_seconds: float = 0.0)
             timeout=timeout,
             allow_redirects=True,
         )
-
         html = response.text or ""
         text = _html_to_text(html)
         blocked = _is_blocked(response.status_code, text)
-
         return FetchResult(
             url=url,
             final_url=str(response.url),
@@ -237,14 +321,11 @@ def fetch_job_page_text(url: str, timeout: int = 25, sleep_seconds: float = 0.0)
             blocked=blocked,
             text=text,
             error="",
+            rendered=False,
         )
     except Exception as exc:
+        prefix = "render_fetch_error" if render else "fetch_error"
         return FetchResult(
-            url=url,
-            final_url=url,
-            status_code=None,
-            ok=False,
-            blocked=False,
-            text="",
-            error=f"fetch_error: {exc}",
+            url=url, final_url=url, status_code=None, ok=False,
+            blocked=False, text="", error=f"{prefix}: {exc}", rendered=render,
         )
