@@ -1,5 +1,5 @@
 def build_prompt(source_text: str) -> str:
-    """Prompt for extracting ONLY job_location, remote_preferences, remote_days
+    """Prompt for extracting ONLY job_location, remote_preference, remote_days
     from a single job posting's live page text."""
     return f"""You are extracting structured data from ONE job posting's web page text.
 
@@ -13,11 +13,13 @@ Return ONLY a JSON object with exactly these three keys and nothing else:
    - Output "Unknown" ONLY when the role is genuinely remote-anywhere with no identifiable country or region.
    - Use ONLY the location of THIS job. IGNORE unrelated job cards, "similar jobs" / "related jobs" / "more jobs" sections, page footers, and the company's head-office address when it differs from where the role is actually based.
 
-2) "remote_preferences"
-   - An array using only the values "onsite", "hybrid", "remote", always in that order.
-   - Include every working pattern the posting genuinely supports (e.g. ["onsite", "hybrid"]).
-   - Include "remote" only if it clearly says fully remote / remote only / remote-first / work from anywhere.
-   - If nothing is stated, return [].
+2) "remote_preference"
+   - Return EXACTLY ONE value: "onsite", "hybrid", or "remote" — or "" (empty) if the posting gives no indication. Never return more than one.
+   - "remote"  = fully remote / home-based / work-from-anywhere, with no requirement to regularly attend an office.
+   - "hybrid"  = a mix of home and office working (some days in the office and some from home, or the posting simply says "hybrid").
+   - "onsite"  = based full-time at an office or work site, with no home working.
+   - A SPLIT WEEK IS HYBRID: e.g. "2 days in the office, 3 days from home" -> "hybrid" (never "onsite", never "remote").
+   - Choose the single best fit. If the posting gives NO indication of remote/hybrid/office working, return "" (empty). Do not guess "onsite".
 
 3) "remote_days"
    - The number of days per week the person works REMOTELY / from home, as a string "0"-"5", OR "not specified".
